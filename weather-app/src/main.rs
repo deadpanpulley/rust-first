@@ -1,10 +1,16 @@
-use eframe::{egui, App, Frame};
+use axum::{
+    extract::Path,
+    http::StatusCode,
+    routing::get,
+    Json, Router,
+};
 use reqwest::Client;
-use serde::Deserialize;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use tokio::runtime::Runtime;
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use tower_http::services::ServeDir;
+use std::env;
 
-// Structs for deserializing the geocoding API response from Open-Meteo
+// --- Structs for Geocoding API ---
 #[derive(Deserialize, Debug)]
 struct GeocodingResponse {
     results: Option<Vec<GeocodingResult>>,
@@ -16,97 +22,51 @@ struct GeocodingResult {
     longitude: f64,
 }
 
-// Structs for deserializing the weather API response from Open-Meteo
+// --- Structs for Weather API ---
 #[derive(Deserialize, Debug)]
-struct WeatherResponse {
-    current_weather: CurrentWeather,
+struct WeatherApiResponse {
+    current: Current,
 }
 
 #[derive(Deserialize, Debug)]
-struct CurrentWeather {
+struct Current {
+    #[serde(rename = "temperature_2m")]
     temperature: f64,
+    #[serde(rename = "wind_speed_10m")]
+    windspeed: f64,
 }
 
-// The main application struct
-struct WeatherApp {
-    city: String,
-    weather_info: Option<String>,
-    runtime: Runtime,
-    // We use a channel to send data from the async thread (fetching weather)
-    // to the main GUI thread.
-    sender: Sender<Option<String>>,
-    receiver: Receiver<Option<String>>,
+// --- Struct for our application's API response ---
+#[derive(Serialize, Debug)]
+struct AppWeatherResponse {
+    temperature: String,
+    windspeed: String,
 }
 
-impl Default for WeatherApp {
-    fn default() -> Self {
-        // Create a channel for communication
-        let (sender, receiver) = channel();
-        Self {
-            city: "Berlin".to_string(), // Default city
-            weather_info: None,
-            runtime: Runtime::new().expect("Failed to create Tokio runtime."),
-            sender,
-            receiver,
-        }
-    }
+#[tokio::main]
+async fn main() {
+    // The router that defines our application
+    let app = Router::new()
+        // API route
+        .route("/api/weather/:city", get(weather_api_handler))
+        // Static file serving for the frontend
+        .nest_service("/", ServeDir::new("static"));
+
+    // Get the port from the environment variable, default to 3000 for local dev
+    let port_str = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let port = port_str.parse::<u16>().expect("PORT must be a number");
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    // Start the server
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    println!("Weather app listening on http://{}", listener.local_addr().unwrap());
+    axum::serve(listener, app.into_make_service()).await.unwrap();
 }
 
-// Implement the eframe::App trait, which is the core of the GUI application
-impl App for WeatherApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        // Check if we have received new weather information from the async task
-        if let Ok(new_info) = self.receiver.try_recv() {
-            self.weather_info = new_info;
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Weather App");
-
-            // Input field for the city
-            ui.horizontal(|ui| {
-                ui.label("City: ");
-                ui.text_edit_singleline(&mut self.city);
-            });
-
-            // Button to trigger the weather fetch
-            if ui.button("Get Weather").clicked() {
-                // Clone the necessary data to move into the async block
-                let city = self.city.clone();
-                let sender = self.sender.clone();
-                let ctx_clone = ctx.clone();
-
-                // Spawn an async task to fetch the weather without blocking the GUI
-                self.runtime.spawn(async move {
-                    let weather_result = fetch_weather(&city).await;
-                    // Send the result back to the main thread
-                    sender.send(weather_result).unwrap();
-                    // Request a repaint to show the new data
-                    ctx_clone.request_repaint();
-                });
-            }
-
-            // Display the weather information
-            if let Some(info) = &self.weather_info {
-                ui.label(info);
-            }
-        });
-    }
-}
-
-// The main entry point of the program
-fn main() -> Result<(), eframe::Error> {
-    let native_options = eframe::NativeOptions::default();
-    // Run the native eframe application
-    eframe::run_native(
-        "Weather App",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(WeatherApp::default()))),
-    )
-}
-
-// Asynchronous function to fetch weather data from the Open-Meteo API
-async fn fetch_weather(city: &str) -> Option<String> {
+// The handler for the /api/weather/:city route
+async fn weather_api_handler(
+    Path(city): Path<String>,
+) -> Result<Json<AppWeatherResponse>, StatusCode> {
     let client = Client::new();
 
     // 1. Geocoding: Convert city name to latitude and longitude
@@ -115,34 +75,42 @@ async fn fetch_weather(city: &str) -> Option<String> {
         city
     );
 
-    let geo_resp = client.get(&geocoding_url).send().await.ok()?;
-    if !geo_resp.status().is_success() {
-        return Some(format!("Error fetching geocoding data for {}", city));
+    let geo_data = client
+        .get(&geocoding_url)
+        .send()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .json::<GeocodingResponse>()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(city_data) = geo_data.results.and_then(|mut r| r.pop()) {
+        let lat = city_data.latitude;
+        let lon = city_data.longitude;
+
+        // 2. Weather Forecast: Get weather using the coordinates
+        let weather_url = format!(
+            "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current=temperature_2m,wind_speed_10m",
+            lat, lon
+        );
+
+        let weather_data = client
+            .get(&weather_url)
+            .send()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .json::<WeatherApiResponse>()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Format the final response
+        let response = AppWeatherResponse {
+            temperature: format!("{}°C", weather_data.current.temperature),
+            windspeed: format!("{} km/h", weather_data.current.windspeed),
+        };
+        Ok(Json(response))
+    } else {
+        // City not found
+        Err(StatusCode::NOT_FOUND)
     }
-    let geo_data: GeocodingResponse = geo_resp.json().await.ok()?;
-
-    if let Some(results) = geo_data.results {
-        if let Some(city_data) = results.first() {
-            let lat = city_data.latitude;
-            let lon = city_data.longitude;
-
-            // 2. Weather Forecast: Get weather using the coordinates
-            let weather_url = format!(
-                "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current_weather=true",
-                lat, lon
-            );
-
-            let weather_resp = client.get(&weather_url).send().await.ok()?;
-            if !weather_resp.status().is_success() {
-                return Some(format!("Error fetching weather data for {}", city));
-            }
-            let weather_data: WeatherResponse = weather_resp.json().await.ok()?;
-
-            // Format the final string to be displayed
-            let temp = weather_data.current_weather.temperature;
-            return Some(format!("The current temperature in {} is {}°C", city, temp));
-        }
-    }
-
-    Some(format!("Could not find city: {}", city))
-}
+}    

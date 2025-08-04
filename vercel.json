@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "weather-app/src/main.rs",
+      "use": "@vercel/rust"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/weather/(.*)",
+      "dest": "weather-app/src/main.rs"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "weather-app/static/$1"
+    }
+  ]
+}
